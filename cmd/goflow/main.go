@@ -7,7 +7,9 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -19,7 +21,8 @@ import (
 )
 
 func main() {
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	if err := godotenv.Load(); err != nil && !errors.Is(err, os.ErrNotExist) {
 		log.Fatalf("load .env: %v", err)
 	}
@@ -37,25 +40,19 @@ func main() {
 		s = job.NewService(store.NewMemoryStore())
 	}
 
-	jobs := make(chan job.Job, 32)
-	runner := worker.NewPool(workerCount(), jobs, func(ctx context.Context, j job.Job) (job.Job, error) {
-		queued, err := s.MarkRunning(ctx, j)
-		if err != nil {
-			return j, err
-		}
-		nextJob, err := job.Execute(ctx, queued)
-		if err != nil {
-			return s.MarkFailed(ctx, queued, err.Error())
-		}
-		return s.MarkSucceeded(ctx, nextJob, nextJob.Result)
-	})
-	runner.Start(ctx)
-	defer runner.Stop()
+	pollingDone := make(chan struct{})
+	go func() {
+		defer close(pollingDone)
+		worker.RunPolling(ctx, workerCount(), 500*time.Millisecond, s.ClaimPending, func(ctx context.Context, j job.Job) (job.Job, error) {
+			nextJob, err := job.Execute(ctx, j)
+			if err != nil {
+				return s.MarkFailed(ctx, j, err.Error())
+			}
+			return s.MarkSucceeded(ctx, nextJob, nextJob.Result)
+		})
+	}()
 
-	httpHandler := api.NewHandler(s, func(ctx context.Context, j job.Job) (job.Job, error) {
-		jobs <- j
-		return j, nil
-	})
+	httpHandler := api.NewHandler(s)
 	server := &http.Server{
 		Addr:         ":8080",
 		Handler:      httpHandler,
@@ -64,19 +61,27 @@ func main() {
 		IdleTimeout:  15 * time.Second,
 	}
 
+	serverErr := make(chan error, 1)
 	go func() {
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("http server error: %v", err)
-		}
+		serverErr <- server.ListenAndServe()
 	}()
 
 	fmt.Println("GoFlow running on :8080")
-	<-ctx.Done()
+	select {
+	case <-ctx.Done():
+	case err := <-serverErr:
+		if err != nil && err != http.ErrServerClosed {
+			log.Printf("http server error: %v", err)
+		}
+		stop()
+	}
+
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		log.Printf("shutdown error: %v", err)
 	}
+	<-pollingDone
 }
 
 func workerCount() int {

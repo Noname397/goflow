@@ -15,6 +15,7 @@ type JobStore interface {
     GetByID(ctx context.Context, id string) (Job, error)
     List(ctx context.Context, status ...JobStatus) ([]Job, error)
     UpdateStatus(ctx context.Context, job Job) (Job, error)
+    ClaimPending(ctx context.Context) (Job, bool, error)
     RecoverPending(ctx context.Context) ([]Job, error)
 }
 
@@ -72,6 +73,16 @@ func (s *Service) RecoverPending(ctx context.Context) ([]Job, error) {
         return nil, nil
     }
     return s.store.RecoverPending(ctx)
+}
+
+func (s *Service) ClaimPending(ctx context.Context) (Job, bool, error) {
+    if s == nil {
+        return Job{}, false, errors.New("job service is nil")
+    }
+    if s.store == nil {
+        return Job{}, false, errors.New("job store is nil")
+    }
+    return s.store.ClaimPending(ctx)
 }
 
 func (s *Service) MarkRunning(ctx context.Context, job Job) (Job, error) {

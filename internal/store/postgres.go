@@ -143,6 +143,56 @@ func (s *PostgresStore) UpdateStatus(ctx context.Context, j job.Job) (job.Job, e
     return j, nil
 }
 
+func (s *PostgresStore) ClaimPending(ctx context.Context) (job.Job, bool, error) {
+    if s == nil || s.db == nil {
+        return job.Job{}, false, fmt.Errorf("postgres store is unavailable")
+    }
+
+    query := `WITH candidate AS (
+    SELECT id
+    FROM jobs
+    WHERE status = 'pending'
+    ORDER BY created_at
+    LIMIT 1
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE jobs AS j
+SET status = 'running', started_at = NOW()
+FROM candidate
+WHERE j.id = candidate.id
+RETURNING j.id, j.type, j.payload, j.status, j.result, j.error_message,
+    j.created_at, j.started_at, j.completed_at`
+
+    var j job.Job
+    var payload, result []byte
+    var createdAt, startedAt, completedAt sql.NullTime
+    err := s.db.QueryRowContext(ctx, query).Scan(
+        &j.ID, &j.Type, &payload, &j.Status, &result, &j.ErrorMessage,
+        &createdAt, &startedAt, &completedAt,
+    )
+    if err == sql.ErrNoRows {
+        return job.Job{}, false, nil
+    }
+    if err != nil {
+        return job.Job{}, false, err
+    }
+
+    j.Payload = parsePayload(payload)
+    j.Result = parseResult(result)
+    if createdAt.Valid {
+        j.CreatedAt = createdAt.Time
+    }
+    if startedAt.Valid {
+        ts := startedAt.Time
+        j.StartedAt = &ts
+    }
+    if completedAt.Valid {
+        ts := completedAt.Time
+        j.CompletedAt = &ts
+    }
+    return j, true, nil
+}
+
 func (s *PostgresStore) RecoverPending(ctx context.Context) ([]job.Job, error) {
     if s == nil || s.db == nil {
         return nil, nil
